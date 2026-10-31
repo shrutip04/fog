@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fog</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#0d1114;color:#eef2f3;font-family:Georgia,'Iowan Old Style',serif;overflow:hidden}
+canvas#cv{position:fixed;inset:0;width:100%;height:100%;display:block}
+#v{position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none}
+.glass{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.38);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+#rec,#snd{position:fixed;bottom:16px;height:52px;border-radius:999px;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;color:#fff;padding:0 16px;font:15px system-ui,sans-serif}
+#rec{right:78px}#snd{right:140px;width:52px;padding:0;font-size:20px}
+#rec.on{background:rgba(214,60,60,.6)}#recDot{color:#ff6b6b}#snd.off{opacity:.45}
+#toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);padding:8px 16px;border-radius:999px;font:14px system-ui,sans-serif;color:#fff;opacity:0;transition:opacity .3s;pointer-events:none;text-align:center}
+#toast.on{opacity:1}
+#ui{display:none}
+#ui.on{display:block}
+#brush{position:fixed;left:16px;bottom:16px;display:flex;align-items:center;gap:10px;padding:9px 16px;border-radius:999px;font:14px system-ui,sans-serif;color:#fff}
+#brush input{width:130px;accent-color:#fff}
+#shutter{position:fixed;right:16px;bottom:16px;width:52px;height:52px;border-radius:50%;display:grid;place-items:center;cursor:pointer;color:#fff;padding:0}
+#shutter:focus-visible,#go:focus-visible{outline:2px solid #fff;outline-offset:3px}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px;background:radial-gradient(ellipse at 50% 40%,#2a343a,#0d1114 70%)}
+#start.off{display:none}
+h1{font-size:clamp(64px,14vw,140px);font-weight:400;letter-spacing:.04em;margin:0;color:#e9eeef;text-shadow:0 0 40px rgba(255,255,255,.25)}
+#go{font:17px Georgia,serif;color:#fff;padding:14px 38px;border-radius:999px;cursor:pointer}
+#go:disabled{opacity:.6;cursor:wait}
+#start p{margin:0;max-width:46ch;line-height:1.5;color:#b9c4c8}
+#how{font-size:14px;color:#8d9a9f}
+#err{color:#ffb4a8;min-height:1.4em;max-width:52ch}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<video id="v" playsinline muted></video>
+<div id="ui">
+  <label id="brush" class="glass">brush<input id="size" type="range" min="7" max="38" value="15"></label>
+  <button id="rec" class="glass" aria-label="Record 10 second clip" title="Record clip (R)"><span id="recDot">●</span><span id="recT"></span></button>
+  <button id="snd" class="glass" aria-label="Toggle sound" title="Sound (M)">♪</button>
+  <button id="shutter" class="glass" aria-label="Save frame" title="Save frame">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M12 2.5l4 7M21 8.5l-8 .2M19.5 18.5l-4-7M8 21l4-7M3 15.5l8-.2M4.5 5.5l4 7"/></svg>
+  </button>
+</div>
+<div id="toast" class="glass"></div>
+<div id="start">
+  <h1>fog</h1>
+  <p>Breathe on the screen to fog it. Pinch and draw to write in the fog. Make a fist and swipe to wipe it clear.</p>
+  <button id="go" class="glass">Start the mirror</button>
+  <div id="err" role="alert"></div>
+  <p>Everything runs in your browser. No video, audio, or data ever leaves this machine.</p>
+  <p id="how">Space fogs without breathing · C clears · S saves · R records 10s · M mutes · Esc returns here</p>
+</div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const fogC = document.createElement('canvas'), fog = fogC.getContext('2d');
+const frC = document.createElement('canvas'), fr = frC.getContext('2d');
+const tinyC = document.createElement('canvas'), tiny = tinyC.getContext('2d');
+const video = $('v');
+const hasFilter = 'filter' in ctx;
+const MP_H = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+const MP_F = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/';
+
+let W = 0, H = 0, dpr = 1, vw = 1280, vh = 720, sc = 1;
+let running = false, stream = null, ac = null, analyser = null, abuf = null;
+let hands = null, face = null, handBusy = false, faceBusy = false, frame = 0;
+let hand = null, mouth = null, fc = null;
+let floor = null, lastKey = 0, spaceHeld = false;
+let pen = false, rel = 0, sm = null, br = null, star = null, last = null, pm = null;
+let lw = null, acc = 0;
+let wspd = 0, pspd = 0, mo = 0, moT = 0, sfx = null, recDest = null, soundOn = true, drips = [], rec = null, recTimer = 0, recT0 = 0, toastT = 0;
+let brushCss = 15;
+
+function layout() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const nw = Math.round(innerWidth * dpr), nh = Math.round(innerHeight * dpr);
+  if (nw === W && nh === H) return;
+  const old = W ? fogC : null, tmp = document.createElement('canvas');
+  if (old) { tmp.width = old.width; tmp.height = old.height; tmp.getContext('2d').drawImage(old, 0, 0); }
+  W = cv.width = fogC.width = frC.width = nw;
+  H = cv.height = fogC.height = frC.height = nh;
+  tinyC.width = Math.max(8, W >> 4); tinyC.height = Math.max(8, H >> 4);
+  if (old) fog.drawImage(tmp, 0, 0, nw, nh); else resetFog();
+  fc = fc || { x: W / 2, y: H * 0.65 };
+  coverFit();
+}
+function coverFit() { sc = Math.max(W / vw, H / vh); }
+function resetFog() {
+  fog.globalCompositeOperation = 'source-over';
+  fog.clearRect(0, 0, W, H);
+  fog.fillStyle = 'rgba(255,255,255,0.55)';
+  fog.fillRect(0, 0, W, H);
+}
+const toScreen = p => ({ x: W / 2 - (p.x - 0.5) * vw * sc, y: H / 2 + (p.y - 0.5) * vh * sc });
+
+function drawVideo(c, z, w, h) {
+  c.save();
+  c.translate(w / 2, h / 2);
+  const k = w / W;
+  c.scale(-z * k, z * k);
+  c.drawImage(video, -vw * sc / 2, -vh * sc / 2, vw * sc, vh * sc);
+  c.restore();
+}
+
+/* ---------- tracking ---------- */
+function onHand(r) {
+  const L = r.multiHandLandmarks && r.multiHandLandmarks[0];
+  if (!L) return;
+  const P = L.map(toScreen);
+  const d = (a, b) => Math.hypot(P[a].x - P[b].x, P[a].y - P[b].y);
+  const palm = d(0, 9) || 1;
+  hand = {
+    P,
+    pinch: d(4, 8) / palm,
+    fist: [[8, 6], [12, 10], [16, 14], [20, 18]].every(([t, j]) => d(t, 0) < d(j, 0)),
+    idxExt: d(8, 0) > d(6, 0) && d(8, 0) > 1.3 * d(5, 0),
+    width: Math.max(d(5, 17), palm),
+    t: performance.now()
+  };
+}
+function onFace(r) {
+  const L = r.multiFaceLandmarks && r.multiFaceLandmarks[0];
+  if (!L) { moT = 0; return; }
+  const a = toScreen(L[13]), b = toScreen(L[14]), t = toScreen(L[10]), c = toScreen(L[152]);
+  mouth = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  const open = Math.hypot(a.x - b.x, a.y - b.y) / (Math.hypot(t.x - c.x, t.y - c.y) || 1);
+  moT = Math.min(1, Math.max(0, (open - 0.03) / 0.05));
+}
+async function runHands() { try { await hands.send({ image: video }); } finally { handBusy = false; } }
+async function runFace() { try { await face.send({ image: video }); } finally { faceBusy = false; } }
+
+/* ---------- fog ops ---------- */
+function blob(x, y, r, a) {
+  const g = fog.createRadialGradient(x, y, r * 0.4, x, y, r);
+  g.addColorStop(0, `rgba(255,255,255,${a})`);
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  fog.fillStyle = g;
+  fog.fillRect(x - r, y - r, r * 2, r * 2);
+}
+function breathe(s) {
+  const R = 0.43 * Math.min(W, H) * (1 + 0.25 * mo);
+  for (let i = 0; i < 12; i++) {
+    const r = R * (0.3 + Math.random() * 0.3);
+    const gx = (Math.random() + Math.random() - 1), gy = (Math.random() + Math.random() - 1);
+    blob(fc.x + gx * R * 0.6 * 1.45, fc.y + R * 0.3 + gy * R * 0.6, r, Math.min(0.6, 0.36 * s * (1 + 0.6 * mo)));
+  }
+}
+function stamp(p, r) {
+  const g = fog.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+  g.addColorStop(0, 'rgba(0,0,0,0.34)');
+  g.addColorStop(0.6, 'rgba(0,0,0,0.2)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  fog.fillStyle = g;
+  fog.fillRect(p.x - r, p.y - r, r * 2, r * 2);
+}
+function wipe(p, r) {
+  const sp = r / 2;
+  wspd = lw ? Math.hypot(p.x - lw.x, p.y - lw.y) / W : 0;
+  fog.globalCompositeOperation = 'destination-out';
+  if (!lw) { stamp(p, r); acc = 0; }
+  else {
+    const dx = p.x - lw.x, dy = p.y - lw.y, L = Math.hypot(dx, dy);
+    if (L > 0.3 * W) { stamp(p, r); acc = 0; }
+    else {
+      let t = sp - acc, n = 0;
+      while (t <= L && n < 40) { stamp({ x: lw.x + dx * t / L, y: lw.y + dy * t / L }, r); t += sp; n++; }
+      acc = n >= 40 ? 0 : L - (t - sp);
+    }
+  }
+  lw = { x: p.x, y: p.y };
+  fog.globalCompositeOperation = 'source-over';
+}
+function penDot(p) {
+  fog.globalCompositeOperation = 'destination-out';
+  fog.fillStyle = '#000';
+  fog.beginPath(); fog.arc(p.x, p.y, brushCss * dpr, 0, 6.2832); fog.fill();
+  fog.globalCompositeOperation = 'source-over';
+}
+function penSegment() {
+  if (Math.hypot(br.x - last.x, br.y - last.y) < 0.0006 * W) return;
+  const mid = { x: (last.x + br.x) / 2, y: (last.y + br.y) / 2 };
+  fog.globalCompositeOperation = 'destination-out';
+  fog.strokeStyle = '#000';
+  fog.lineWidth = brushCss * 2 * dpr;
+  fog.lineCap = 'round'; fog.lineJoin = 'round';
+  fog.beginPath(); fog.moveTo(pm.x, pm.y);
+  fog.quadraticCurveTo(last.x, last.y, mid.x, mid.y);
+  fog.stroke();
+  fog.globalCompositeOperation = 'source-over';
+  if (Math.random() < 0.05 && drips.length < 60) drips.push({ x: br.x, y: br.y, age: 0, delay: 60 + Math.random() * 180, v: 0, run: 0, max: (40 + Math.random() * 120) * dpr, w: 1 + Math.random() * 1.5 });
+  last = { x: br.x, y: br.y }; pm = mid;
+}
+
+/* ---------- main loop ---------- */
+function loop() {
+  requestAnimationFrame(loop);
+  if (!running || video.readyState < 2) return;
+  frame++;
+  const now = performance.now();
+  if (!handBusy) { handBusy = true; runHands(); }
+  if (frame % 5 === 0 && !faceBusy) { faceBusy = true; runFace(); }
+
+  // gestures
+  const h = hand && now - hand.t < 250 ? hand : null;
+  let wiping = false;
+  if (h) {
+    const tip = h.P[8];
+    if (!pen) {
+      if (h.pinch < 0.22 && !h.fist && h.idxExt) {
+        pen = true; rel = 0;
+        sm = { ...tip }; br = { ...tip }; star = { ...tip }; last = { ...tip }; pm = { ...tip };
+        penDot(tip);
+      }
+    } else {
+      if (h.fist || h.pinch > 0.38) rel++; else rel = 0;
+      if (rel >= 2) pen = false;
+    }
+    if (pen) {
+      sm.x += (tip.x - sm.x) * 0.45; sm.y += (tip.y - sm.y) * 0.45;
+      br.x += (sm.x - br.x) * 0.22; br.y += (sm.y - br.y) * 0.22;
+      star.x += (tip.x - star.x) * 0.55; star.y += (tip.y - star.y) * 0.55;
+      pspd = Math.hypot(br.x - last.x, br.y - last.y) / W;
+      penSegment();
+    } else if (h.fist) { wiping = true; wipe(h.P[9], h.width * 1.6); }
+  } else pen = false;
+  if (!wiping) lw = null;
+
+  // breath
+  let s = 0;
+  if (analyser) {
+    analyser.getFloatTimeDomainData(abuf);
+    let sum = 0; for (let i = 0; i < abuf.length; i++) sum += abuf[i] * abuf[i];
+    const lvl = Math.sqrt(sum / abuf.length);
+    if (floor === null) floor = lvl;
+    floor += (lvl - floor) * (lvl < floor ? 0.05 : 0.0008);
+    s = Math.min(1, Math.max(0, (lvl - floor - 0.0025) / 0.0005));
+    if (now - lastKey < 300) s = 0;
+  }
+  if (spaceHeld) s = 1;
+  if (mouth) { fc.x += (mouth.x - fc.x) * 0.4; fc.y += (mouth.y - fc.y) * 0.4; }
+  if (s > 0 && !pen && !wiping && frame % 2 === 0) breathe(s);
+
+  mo += (moT - mo) * 0.3;
+  updateDrips();
+  if (sfx) {
+    setV(sfx.write, pen ? Math.min(0.07, pspd * 40) : 0, 3200 + pspd * 30000);
+    setV(sfx.wipe, wiping ? Math.min(0.14, wspd * 10) : 0, 900 + wspd * 6000);
+    setV(sfx.fog, s > 0 && !pen && !wiping ? 0.05 * s * (1 + mo) : 0);
+  }
+  // render
+  ctx.clearRect(0, 0, W, H);
+  drawVideo(ctx, 1, W, H);
+  fr.globalCompositeOperation = 'source-over';
+  fr.clearRect(0, 0, W, H);
+  if (hasFilter) {
+    fr.filter = `blur(${18 * dpr}px) brightness(1.18)`;
+    drawVideo(fr, 1.06, W, H);
+    fr.filter = 'none';
+  } else {
+    tiny.clearRect(0, 0, tinyC.width, tinyC.height);
+    drawVideo(tiny, 1.06, tinyC.width, tinyC.height);
+    fr.imageSmoothingEnabled = true;
+    fr.drawImage(tinyC, 0, 0, W, H);
+  }
+  fr.fillStyle = 'rgba(242,238,231,0.62)';
+  fr.fillRect(0, 0, W, H);
+  fr.globalCompositeOperation = 'destination-in';
+  fr.drawImage(fogC, 0, 0);
+  fr.globalCompositeOperation = 'source-over';
+  ctx.drawImage(frC, 0, 0);
+
+  for (const d of drips) if (d.age >= d.delay) {
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.beginPath(); ctx.arc(d.x, d.y, (1.6 + d.w) * dpr, 0, 6.2832); ctx.fill();
+  }
+  if (pen) drawStar(star.x, star.y);
+}
+function drawStar(x, y) {
+  const r = 22 * dpr;
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(255,255,255,.95)'); g.addColorStop(0.35, 'rgba(255,248,220,.45)'); g.addColorStop(1, 'rgba(255,248,220,0)');
+  ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  ctx.fillStyle = '#fff'; ctx.beginPath();
+  const o = 10 * dpr, i = 2.6 * dpr;
+  for (let k = 0; k < 8; k++) {
+    const a = k * Math.PI / 4 - Math.PI / 2, rr = k % 2 ? i : o;
+    ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+/* ---------- drips, sound, recording ---------- */
+function updateDrips() {
+  fog.globalCompositeOperation = 'destination-out';
+  fog.strokeStyle = '#000'; fog.lineCap = 'round';
+  for (const d of drips) {
+    if (++d.age < d.delay) continue;
+    d.v = Math.min(d.v + 0.015 * dpr, 2 * dpr);
+    const nx = d.x + (Math.random() - 0.5) * 0.4 * dpr, ny = d.y + d.v;
+    fog.lineWidth = (1.5 + d.w) * dpr;
+    fog.beginPath(); fog.moveTo(d.x, d.y); fog.lineTo(nx, ny); fog.stroke();
+    d.x = nx; d.y = ny; d.run += d.v;
+  }
+  fog.globalCompositeOperation = 'source-over';
+  drips = drips.filter(d => d.run < d.max && d.y < H);
+}
+function initSfx() {
+  const nb = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = nb.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  recDest = ac.createMediaStreamDestination();
+  const mk = (f, q) => {
+    const src = ac.createBufferSource(); src.buffer = nb; src.loop = true;
+    const fl = ac.createBiquadFilter(); fl.type = 'bandpass'; fl.frequency.value = f; fl.Q.value = q;
+    const g = ac.createGain(); g.gain.value = 0;
+    src.connect(fl); fl.connect(g); g.connect(ac.destination); g.connect(recDest); src.start();
+    return { g, fl };
+  };
+  sfx = { fog: mk(2400, 0.5), wipe: mk(1000, 0.8), write: mk(3200, 8) };
+}
+function setV(v, a, f) {
+  const t = ac.currentTime;
+  v.g.gain.setTargetAtTime(soundOn ? a : 0, t, 0.05);
+  if (f) v.fl.frequency.setTargetAtTime(f, t, 0.05);
+}
+function toast(m) {
+  const t = $('toast'); t.textContent = m; t.classList.add('on');
+  clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('on'), 2400);
+}
+function toggleSound() {
+  soundOn = !soundOn; $('snd').classList.toggle('off', !soundOn);
+  toast(soundOn ? 'Sound on. Headphones stop the mic hearing it.' : 'Sound off');
+}
+function toggleRec() {
+  if (rec) { if (rec.state === 'recording') rec.stop(); return; }
+  if (!window.MediaRecorder) { toast('Recording is not supported in this browser'); return; }
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find(m => MediaRecorder.isTypeSupported(m));
+  if (!mime) { toast('This browser cannot record WebM. Try Chrome or Firefox.'); return; }
+  const cs = cv.captureStream(30);
+  if (recDest) recDest.stream.getAudioTracks().forEach(t => cs.addTrack(t));
+  const chunks = [];
+  rec = new MediaRecorder(cs, { mimeType: mime });
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    clearInterval(recTimer); rec = null; $('rec').classList.remove('on'); $('recT').textContent = '';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' })); a.download = 'fog.webm'; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  rec.start(); recT0 = performance.now(); $('rec').classList.add('on');
+  recTimer = setInterval(() => {
+    const left = 10 - Math.floor((performance.now() - recT0) / 1000);
+    $('recT').textContent = left + 's';
+    if (left <= 0 && rec && rec.state === 'recording') rec.stop();
+  }, 250);
+}
+
+/* ---------- start / stop ---------- */
+const startEl = $('start'), ui = $('ui'), err = $('err'), go = $('go');
+async function start() {
+  err.textContent = '';
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    err.textContent = 'The camera needs https or localhost. Opening this file by double-click (file://) will not work: run "python3 -m http.server" in this folder and open http://localhost:8000/fog.html.';
+    return;
+  }
+  go.disabled = true; go.textContent = 'Starting…';
+  try {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+    } catch (e) {
+      err.textContent = (e.name === 'NotAllowedError' || e.name === 'SecurityError')
+        ? 'Camera or microphone access was refused. Allow both in the address bar, then reload and try again.'
+        : `Could not open the camera or microphone: ${e.name}. ${e.message}`;
+      throw e;
+    }
+    video.srcObject = stream;
+    await video.play();
+    vw = video.videoWidth; vh = video.videoHeight; coverFit();
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    await ac.resume();
+    analyser = ac.createAnalyser(); analyser.fftSize = 1024;
+    abuf = new Float32Array(analyser.fftSize);
+    ac.createMediaStreamSource(new MediaStream(stream.getAudioTracks())).connect(analyser);
+    floor = null;
+    initSfx();
+    if (!hands) {
+      go.textContent = 'Loading hand tracking…';
+      hands = new Hands({ locateFile: f => MP_H + f });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+      hands.onResults(onHand);
+      await hands.initialize();
+      face = new FaceMesh({ locateFile: f => MP_F + f });
+      face.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      face.onResults(onFace);
+      await face.initialize();
+    }
+    startEl.classList.add('off'); ui.classList.add('on');
+    running = true;
+  } catch (e) {
+    if (!err.textContent) err.textContent = `Could not start: ${e.message || e}`;
+    stop();
+    throw e;
+  } finally {
+    go.disabled = false; go.textContent = 'Start the mirror';
+  }
+}
+function stop() {
+  if (rec && rec.state === 'recording') rec.stop();
+  running = false; pen = false; lw = null; sfx = null; recDest = null; drips = [];
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null;
+  if (ac) ac.close(); ac = null; analyser = null;
+  startEl.classList.remove('off'); ui.classList.remove('on');
+}
+function save() {
+  cv.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = 'fog.png'; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+}
+
+go.addEventListener('click', start);
+$('shutter').addEventListener('click', save);
+$('rec').addEventListener('click', toggleRec);
+$('snd').addEventListener('click', toggleSound);
+$('size').addEventListener('input', e => { brushCss = +e.target.value; });
+addEventListener('resize', layout);
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { spaceHeld = true; if (running) e.preventDefault(); }
+  else lastKey = performance.now();
+  if (!running) return;
+  if (e.key === 'c' || e.key === 'C') { resetFog(); drips = []; }
+  else if (e.key === 's' || e.key === 'S') save();
+  else if (e.key === 'r' || e.key === 'R') toggleRec();
+  else if (e.key === 'm' || e.key === 'M') toggleSound();
+  else if (e.key === 'Escape') stop();
+});
+addEventListener('keyup', e => { if (e.code === 'Space') spaceHeld = false; });
+layout();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
