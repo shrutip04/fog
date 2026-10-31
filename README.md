@@ -2,7 +2,7 @@
 
 # fog
 
-A bathroom mirror that has fogged up, made from your webcam. Breathe on your laptop and fog blooms. Pinch to write in it. Make a fist and swipe to wipe it clear.
+A mirror that has fogged up, made from your webcam. Breathe on your laptop and fog blooms. Pinch to write in it. Make a fist and swipe to wipe it clear.
 
 **Try it:** https://shrutip04.github.io/fog/
 
